@@ -1,0 +1,12 @@
+.git
+.venv
+__pycache__
+**/__pycache__
+.pytest_cache
+*.py[cod]
+.env
+mwangazabiz.db
+test_runtime.db
+uploads
+backups
+tests
