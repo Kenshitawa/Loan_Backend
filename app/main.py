@@ -341,6 +341,17 @@ def create_user(data:UserCreateIn,db:Session=Depends(db_session),user:User=Depen
     db.add(created); db.flush(); db.add(AuditLog(actor_id=user.id,entity="user",entity_id=created.id,action="create",details=f"role={created.role.value}",organization_id=user.organization_id,branch_id=user.branch_id)); db.commit(); db.refresh(created)
     return {"id":created.id,"username":created.username,"role":created.role.value,"active":created.active,"must_change_password":created.must_change_password,"branch_id":created.branch_id,"created_at":created.created_at}
 
+@app.delete("/api/v1/users/{user_id}")
+def remove_user(user_id:int,db:Session=Depends(db_session),user:User=Depends(require(Role.admin))):
+    if user_id==user.id: raise HTTPException(400,"You cannot remove your own administrator account")
+    target=db.scalar(select(User).where(User.id==user_id,User.organization_id==user.organization_id))
+    if not target: raise HTTPException(404,"Team member not found")
+    if target.active:
+        target.active=False
+        db.add(AuditLog(actor_id=user.id,entity="user",entity_id=target.id,action="deactivate",details=f"username={target.username}; role={target.role.value}",organization_id=user.organization_id,branch_id=user.branch_id))
+        db.commit()
+    return {"status":"deactivated","id":target.id,"username":target.username}
+
 @app.post("/api/v1/customers")
 def create_customer(data:CustomerIn,db:Session=Depends(db_session),user:User=Depends(require(*WRITE_ROLES))):
     if db.scalar(select(Customer).where((Customer.phone==data.phone)|(Customer.national_id==data.national_id))): raise HTTPException(409,"Customer with that ID or phone already exists")
