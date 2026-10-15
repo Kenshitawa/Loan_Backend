@@ -23,6 +23,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./mwangazabiz.db")
+# Render provides PostgreSQL URLs without a SQLAlchemy driver suffix. This
+# project installs psycopg 3, so normalize those URLs before creating the engine.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL.removeprefix("postgres://")
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL.removeprefix("postgresql://")
 SECRET_KEY = os.getenv("SECRET_KEY", "development-only-change-me")
 ALGORITHM = "HS256"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})

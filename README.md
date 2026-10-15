@@ -24,6 +24,16 @@ The local development database is `mwangazabiz.db` and is intentionally ignored 
 
 Deploy this repository as a Docker web service with a managed PostgreSQL database and persistent file storage. The included `Dockerfile` applies Alembic migrations and creates the first admin only when the database has no admin.
 
+## Deploy this API on Render
+
+1. In Render, create a **PostgreSQL** database and a **Web Service** connected to this GitHub repository. Choose the Docker runtime so Render uses the included `Dockerfile`.
+2. Connect the web service to the database using Render's internal connection URL as `DATABASE_URL`. This backend automatically converts Render's standard PostgreSQL URL to the installed psycopg driver format.
+3. Add the remaining environment variables below in the Render dashboard. Set `APP_ENV` to `production` and set `CORS_ORIGINS` to the exact Vercel site URL (for example, `https://your-site.vercel.app`, no trailing slash).
+4. To keep uploaded customer ID and profile photos after restarts, attach a persistent disk to the web service at `/app/uploads`, then set `UPLOAD_DIR=/app/uploads`. Render disks require a paid web service and the service must stay at one instance while this disk is attached.
+5. Once Render finishes deploying, check `https://YOUR-RENDER-SERVICE.onrender.com/api/v1/health`. In Vercel, set `VITE_API_URL` to `https://YOUR-RENDER-SERVICE.onrender.com/api/v1`, then redeploy the frontend.
+
+Use a test database and dummy customer data while setting this up. Render's free web services cannot use persistent disks, and its free PostgreSQL databases expire after 30 days; those free resources are for testing, not real loan records or identity documents. See Render's [persistent disk guide](https://render.com/docs/disks) and [free tier limitations](https://render.com/docs/free).
+
 Configure these environment variables in the hosting provider's private settings:
 
 - `APP_ENV=production`
