@@ -2,7 +2,7 @@
 from alembic import op
 import sqlalchemy as sa
 
-revision="0003_customer_profiles_and_forced_password"
+revision="0003_profiles_password"
 down_revision="0002_collection_assignment"
 branch_labels=None
 depends_on=None
