@@ -58,6 +58,7 @@ class User(Scoped):
     role: Mapped[Role]=mapped_column(Enum(Role), default=Role.read_only)
     active: Mapped[bool]=mapped_column(Boolean, default=True)
     must_change_password: Mapped[bool]=mapped_column(Boolean, default=False)
+    password_changed_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     failed_logins: Mapped[int]=mapped_column(Integer, default=0)
     locked_until: Mapped[Optional[datetime]]=mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -294,9 +295,16 @@ def current_user(request:Request,token:str=Depends(oauth), db:Session=Depends(db
     except (JWTError,KeyError): raise HTTPException(401,"Invalid or expired token")
     user=db.scalar(select(User).where(User.username==username,User.active==True))
     if not user: raise HTTPException(401,"User not found")
-    if user.must_change_password and request.url.path not in ("/api/v1/auth/me","/api/v1/auth/change-password"):
-        raise HTTPException(403,"Change your temporary password before continuing")
+    if (user.must_change_password or password_expired(user)) and request.url.path not in ("/api/v1/auth/me","/api/v1/auth/change-password"):
+        if user.must_change_password:
+            raise HTTPException(403,"Change your temporary password before continuing")
+        raise HTTPException(403,"Your password has expired. Change it before continuing")
     return user
+
+def password_expired(user:User, now:Optional[datetime]=None)->bool:
+    changed_at=user.password_changed_at or user.created_at
+    if changed_at.tzinfo is None: changed_at=changed_at.replace(tzinfo=timezone.utc)
+    return (now or datetime.now(timezone.utc))-changed_at >= timedelta(days=30)
 
 def require(*roles:Role):
     def check(user:User=Depends(current_user)):
@@ -321,7 +329,7 @@ def login(data:LoginIn, db:Session=Depends(db_session)):
     user.failed_logins=0
     token=jwt.encode({"sub":user.username,"type":"access","exp":datetime.now(timezone.utc)+timedelta(hours=8)},SECRET_KEY,algorithm=ALGORITHM)
     refresh_token=jwt.encode({"sub":user.username,"type":"refresh","exp":datetime.now(timezone.utc)+timedelta(days=14)},SECRET_KEY,algorithm=ALGORITHM); db.commit()
-    return {"access_token":token,"refresh_token":refresh_token,"token_type":"bearer","role":user.role.value,"must_change_password":user.must_change_password}
+    return {"access_token":token,"refresh_token":refresh_token,"token_type":"bearer","role":user.role.value,"must_change_password":user.must_change_password or password_expired(user)}
 
 @app.post("/api/v1/auth/refresh")
 def refresh(token:str=Depends(oauth),db:Session=Depends(db_session)):
@@ -331,18 +339,21 @@ def refresh(token:str=Depends(oauth),db:Session=Depends(db_session)):
     except JWTError: raise HTTPException(401,"Invalid or expired refresh token")
     user=db.scalar(select(User).where(User.username==claims["sub"],User.active==True))
     if not user: raise HTTPException(401,"User not found")
-    if user.must_change_password: raise HTTPException(403,"Change your temporary password before continuing")
+    if user.must_change_password or password_expired(user): raise HTTPException(403,"Change your password before continuing")
     access=jwt.encode({"sub":user.username,"type":"access","exp":datetime.now(timezone.utc)+timedelta(hours=8)},SECRET_KEY,algorithm=ALGORITHM)
     return {"access_token":access,"token_type":"bearer"}
 
 @app.get("/api/v1/auth/me")
-def me(user:User=Depends(current_user)): return {"id":user.id,"username":user.username,"role":user.role.value,"branch_id":user.branch_id,"must_change_password":user.must_change_password}
+def me(user:User=Depends(current_user)):
+    expires_at=user.password_changed_at+timedelta(days=30)
+    expired=password_expired(user)
+    return {"id":user.id,"username":user.username,"role":user.role.value,"branch_id":user.branch_id,"must_change_password":user.must_change_password or expired,"password_expired":expired,"password_changed_at":user.password_changed_at,"password_expires_at":expires_at}
 
 @app.post("/api/v1/auth/change-password")
 def change_password(data:ChangePasswordIn,db:Session=Depends(db_session),user:User=Depends(current_user)):
     if not password_hash.verify(data.old_password,user.password): raise HTTPException(400,"Current password is incorrect")
     if password_hash.verify(data.new_password,user.password): raise HTTPException(422,"Choose a different password")
-    user.password=password_hash.hash(data.new_password); user.must_change_password=False
+    user.password=password_hash.hash(data.new_password); user.must_change_password=False; user.password_changed_at=datetime.now(timezone.utc)
     db.add(AuditLog(actor_id=user.id,entity="user",entity_id=user.id,action="change_password",organization_id=user.organization_id,branch_id=user.branch_id)); db.commit()
     return {"status":"password_changed"}
 
