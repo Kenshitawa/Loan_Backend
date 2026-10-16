@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 from sqlalchemy import MetaData, create_engine, func, make_url, select, text
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.main import Base
 
 
