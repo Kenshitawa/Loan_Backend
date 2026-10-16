@@ -7,3 +7,4 @@ mwangazabiz.db
 test_runtime.db
 uploads/
 backups/
+migration_check*.db

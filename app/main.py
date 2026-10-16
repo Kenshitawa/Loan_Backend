@@ -4,6 +4,8 @@ from __future__ import annotations
 import enum
 import os
 import calendar
+import hashlib
+import re
 from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -17,10 +19,10 @@ from jose import JWTError, jwt
 from pwdlib import PasswordHash
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import (Boolean, Date, DateTime, Enum, ForeignKey, Integer, String,
-                        Text, UniqueConstraint, create_engine, select, func)
+                        Text, UniqueConstraint, create_engine, select, func, or_)
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./mwangazabiz.db")
 # Render provides PostgreSQL URLs without a SQLAlchemy driver suffix. This
@@ -64,8 +66,8 @@ class User(Scoped):
 class Customer(Scoped):
     __tablename__="customers"
     full_name: Mapped[str]=mapped_column(String(160), index=True)
-    national_id: Mapped[str]=mapped_column(String(40), unique=True, index=True)
-    phone: Mapped[str]=mapped_column(String(30), unique=True, index=True)
+    national_id: Mapped[Optional[str]]=mapped_column(String(40), unique=True, index=True, nullable=True)
+    phone: Mapped[Optional[str]]=mapped_column(String(30), unique=True, index=True, nullable=True)
     location: Mapped[str]=mapped_column(String(160))
     next_of_kin: Mapped[str]=mapped_column(String(160), default="")
     guarantors: Mapped[str]=mapped_column(Text, default="")
@@ -89,6 +91,24 @@ class CustomerInteraction(Scoped):
     summary: Mapped[str]=mapped_column(Text)
     direction: Mapped[str]=mapped_column(String(20), default="outbound")
     follow_up: Mapped[Optional[date]]=mapped_column(Date, nullable=True, index=True)
+
+class LegacyPortfolioLoan(Scoped):
+    """Imported opening snapshot; never participates in the live loan ledger."""
+    __tablename__="legacy_portfolio_loans"
+    __table_args__=(UniqueConstraint("organization_id", "source_key"),)
+    customer_id: Mapped[int]=mapped_column(ForeignKey("customers.id"), index=True)
+    source_key: Mapped[str]=mapped_column(String(64))
+    source_sheet: Mapped[str]=mapped_column(String(80), default="Entire")
+    source_row: Mapped[int]=mapped_column(Integer)
+    source_date: Mapped[str]=mapped_column(String(80), default="")
+    principal_cents: Mapped[Optional[int]]=mapped_column(Integer, nullable=True)
+    total_due_cents: Mapped[Optional[int]]=mapped_column(Integer, nullable=True)
+    balance_cents: Mapped[Optional[int]]=mapped_column(Integer, nullable=True)
+    balance_formula: Mapped[str]=mapped_column(Text, default="")
+    balance_is_formula: Mapped[bool]=mapped_column(Boolean, default=False)
+    last_payment: Mapped[str]=mapped_column(String(100), default="")
+    guarantor: Mapped[str]=mapped_column(String(160), default="")
+    guarantor_phone: Mapped[str]=mapped_column(String(30), default="")
 
 class LoanProduct(Scoped):
     __tablename__="loan_products"
@@ -236,7 +256,7 @@ class UserCreateIn(BaseModel): username:str=Field(min_length=3,max_length=80); p
 class ChangePasswordIn(BaseModel): old_password:str; new_password:str=Field(min_length=12,max_length=128)
 class InteractionIn(BaseModel): interaction_type:str=Field(pattern="^(call|visit|message|note)$"); summary:str=Field(min_length=2,max_length=3000); direction:str=Field(default="outbound",pattern="^(inbound|outbound|internal)$"); follow_up:Optional[date]=None
 class AssignmentIn(BaseModel): collector_id:int
-class CustomerIn(BaseModel): full_name:str; national_id:str; phone:str; location:str; next_of_kin:str=""; guarantors:str=""; occupation:str=""; monthly_income_cents:int=Field(ge=0)
+class CustomerIn(BaseModel): full_name:str; national_id:Optional[str]=None; phone:Optional[str]=None; location:str; next_of_kin:str=""; guarantors:str=""; occupation:str=""; monthly_income_cents:int=Field(ge=0)
 class ProductIn(BaseModel): name:str=Field(min_length=2,max_length=120); min_cents:int=Field(gt=0); max_cents:int=Field(gt=0); annual_rate:Decimal=Field(ge=0,le=2); interest_method:InterestMethod; term_periods:int=Field(gt=0,le=365); frequency:Frequency; processing_fee_cents:int=Field(ge=0); penalty_daily_cents:int=Field(ge=0); grace_days:int=Field(ge=0)
 class LoanIn(BaseModel): customer_id:int; product_id:int; principal_cents:int=Field(gt=0)
 class PaymentIn(BaseModel): loan_id:int; amount_cents:int=Field(gt=0); method:str=Field(pattern="^(cash|mpesa|bank)$"); reference:str=Field(default="",max_length=120)
@@ -354,7 +374,10 @@ def remove_user(user_id:int,db:Session=Depends(db_session),user:User=Depends(req
 
 @app.post("/api/v1/customers")
 def create_customer(data:CustomerIn,db:Session=Depends(db_session),user:User=Depends(require(*WRITE_ROLES))):
-    if db.scalar(select(Customer).where((Customer.phone==data.phone)|(Customer.national_id==data.national_id))): raise HTTPException(409,"Customer with that ID or phone already exists")
+    duplicate_filters=[]
+    if data.phone: duplicate_filters.append(Customer.phone==data.phone)
+    if data.national_id: duplicate_filters.append(Customer.national_id==data.national_id)
+    if duplicate_filters and db.scalar(select(Customer).where(Customer.organization_id==user.organization_id,Customer.deleted==False,or_(*duplicate_filters))): raise HTTPException(409,"Customer with that ID or phone already exists")
     customer=Customer(**data.model_dump(),organization_id=user.organization_id,branch_id=user.branch_id); db.add(customer); db.flush(); db.add(AuditLog(actor_id=user.id,entity="customer",entity_id=customer.id,action="create")); db.commit(); db.refresh(customer); return customer
 
 @app.post("/api/v1/customers/{customer_id}/documents")
@@ -365,9 +388,10 @@ async def upload_customer_document(customer_id:int,file:UploadFile=File(...),doc
     if document_type=="profile_photo" and file.content_type not in ("image/jpeg","image/png"): raise HTTPException(415,"Profile photos must be JPEG or PNG images")
     content=await file.read(10*1024*1024+1)
     if len(content)>10*1024*1024: raise HTTPException(413,"Document exceeds 10 MB")
-    from app.adapters import LocalStorageProvider
     safe_name=f"{user.organization_id}/{customer_id}/{uuid4().hex}_{Path(file.filename or 'document').name}"
-    key=LocalStorageProvider(os.getenv("UPLOAD_DIR","uploads")).save(safe_name,content)
+    from app.adapters import customer_storage
+    try: key=customer_storage().save(safe_name,content,file.content_type or "application/octet-stream")
+    except RuntimeError as exc: raise HTTPException(503,str(exc)) from exc
     doc=CustomerDocument(customer_id=customer_id,document_type=document_type,filename=Path(file.filename or "document").name,storage_key=key,uploaded_by=user.id,organization_id=user.organization_id,branch_id=user.branch_id)
     db.add(doc); db.flush(); db.add(AuditLog(actor_id=user.id,entity="customer_document",entity_id=doc.id,action="upload",details=f"customer_id={customer_id},type={document_type}",organization_id=user.organization_id,branch_id=user.branch_id)); db.commit(); db.refresh(doc); return {"id":doc.id,"customer_id":doc.customer_id,"document_type":doc.document_type,"filename":doc.filename,"created_at":doc.created_at}
 
@@ -375,18 +399,123 @@ async def upload_customer_document(customer_id:int,file:UploadFile=File(...),doc
 def download_customer_document(customer_id:int,document_id:int,db:Session=Depends(db_session),user:User=Depends(require(Role.admin,Role.manager,Role.branch_manager,Role.loan_officer))):
     doc=db.get(CustomerDocument,document_id); customer=db.get(Customer,customer_id)
     if not doc or not customer or doc.customer_id!=customer_id or customer.organization_id!=user.organization_id: raise HTTPException(404,"Document not found")
-    path=Path(doc.storage_key)
-    if not path.is_file(): raise HTTPException(404,"Stored document not found")
-    from fastapi.responses import FileResponse
-    media_type="application/pdf" if path.suffix.lower()==".pdf" else "image/png" if path.suffix.lower()==".png" else "image/jpeg"
-    return FileResponse(path,media_type=media_type,filename=doc.filename)
+    from app.adapters import customer_storage
+    try: content=customer_storage().load(doc.storage_key)
+    except FileNotFoundError: raise HTTPException(404,"Stored document not found")
+    except RuntimeError as exc: raise HTTPException(503,str(exc)) from exc
+    from urllib.parse import quote
+    media_type="application/pdf" if doc.filename.lower().endswith(".pdf") else "image/png" if doc.filename.lower().endswith(".png") else "image/jpeg"
+    return Response(content=content,media_type=media_type,headers={"Content-Disposition":f"attachment; filename*=UTF-8''{quote(doc.filename)}"})
 
 @app.get("/api/v1/customers")
 def list_customers(page:int=Query(1,ge=1),limit:int=Query(25,ge=1,le=100),q:str="",db:Session=Depends(db_session),user:User=Depends(current_user)):
     stmt=select(Customer).where(Customer.deleted==False,Customer.organization_id==user.organization_id)
     if q: stmt=stmt.where((Customer.full_name.ilike(f"%{q}%"))|(Customer.phone.ilike(f"%{q}%"))|(Customer.national_id.ilike(f"%{q}%")))
     total=db.scalar(select(func.count()).select_from(stmt.subquery())) or 0; items=db.scalars(stmt.order_by(Customer.id.desc()).offset((page-1)*limit).limit(limit)).all()
-    return {"items":[{**{k:getattr(c,k) for k in ("id","full_name","national_id","phone","location","occupation","monthly_income_cents")},"national_id": c.national_id if user.role in (Role.admin,Role.manager,Role.branch_manager,Role.loan_officer) else "••••"+c.national_id[-4:],"phone":c.phone if user.role!=Role.read_only else "••••"+c.phone[-4:]} for c in items],"total":total,"page":page,"limit":limit}
+    return {"items":[{**{k:getattr(c,k) for k in ("id","full_name","national_id","phone","location","occupation","monthly_income_cents")},"national_id": c.national_id if not c.national_id or user.role in (Role.admin,Role.manager,Role.branch_manager,Role.loan_officer) else "••••"+c.national_id[-4:],"phone":c.phone if not c.phone or user.role!=Role.read_only else "••••"+c.phone[-4:]} for c in items],"total":total,"page":page,"limit":limit}
+
+def _portfolio_headers(sheet):
+    for row_number, row in enumerate(sheet.iter_rows(values_only=True), 1):
+        normalized={str(value).strip().lower():index for index,value in enumerate(row) if value is not None}
+        if "client name" in normalized:
+            return row_number, normalized
+    raise HTTPException(422,"Could not find the 'Client name' header on the Entire tab")
+
+def _portfolio_cell(row, headers, *names):
+    for name in names:
+        index=headers.get(name.lower())
+        if index is not None and index<len(row): return row[index]
+    return None
+
+def _portfolio_text(value):
+    if value is None: return ""
+    if isinstance(value, (datetime,date)): return value.isoformat()
+    return str(value).strip()
+
+def _portfolio_cents(value):
+    if value is None or isinstance(value,bool): return None
+    try:
+        number=Decimal(str(value).replace(",","").replace("KES","").strip())
+        if not number.is_finite(): return None
+        return int((number*100).quantize(Decimal("1"),rounding=ROUND_HALF_UP))
+    except Exception: return None
+
+def _phone_key(value): return re.sub(r"\D", "", value or "")
+def _name_key(value): return " ".join((value or "").casefold().split())
+
+@app.post("/api/v1/imports/legacy-portfolio")
+async def import_legacy_portfolio(file:UploadFile=File(...),commit:bool=Query(False),db:Session=Depends(db_session),user:User=Depends(require(Role.admin))):
+    """Preview or explicitly import the Entire worksheet as legacy opening snapshots."""
+    if not (file.filename or "").lower().endswith(".xlsx"): raise HTTPException(415,"Choose the original .xlsx workbook")
+    content=await file.read(15*1024*1024+1)
+    if len(content)>15*1024*1024: raise HTTPException(413,"Workbook exceeds 15 MB")
+    try:
+        from openpyxl import load_workbook
+        from io import BytesIO
+        values=load_workbook(BytesIO(content),read_only=True,data_only=True)
+        formulas=load_workbook(BytesIO(content),read_only=True,data_only=False)
+        if "Entire" not in values.sheetnames or "Entire" not in formulas.sheetnames: raise HTTPException(422,"Workbook must contain the selected 'Entire' tab")
+        value_sheet=values["Entire"]; formula_sheet=formulas["Entire"]
+        header_row,headers=_portfolio_headers(value_sheet)
+        _,formula_headers=_portfolio_headers(formula_sheet)
+        rows=[]
+        for row_number,(value_row,formula_row) in enumerate(zip(value_sheet.iter_rows(min_row=header_row+1,values_only=True),formula_sheet.iter_rows(min_row=header_row+1,values_only=True)),header_row+1):
+            name=_portfolio_text(_portfolio_cell(value_row,headers,"Client name"))
+            if not name: continue
+            formula=_portfolio_text(_portfolio_cell(formula_row,formula_headers,"balance"))
+            is_formula=formula.startswith("=")
+            source_values=[str(row_number),*[_portfolio_text(v) for v in value_row]]
+            key=hashlib.sha256("\x1f".join(source_values).encode("utf-8")).hexdigest()
+            rows.append({"row":row_number,"key":key,"name":name,"phone":_portfolio_text(_portfolio_cell(value_row,headers,"Tel number","Telephone","Phone")),"occupation":_portfolio_text(_portfolio_cell(value_row,headers,"Occupation")),"date":_portfolio_text(_portfolio_cell(value_row,headers,"Date")),"principal":_portfolio_cents(_portfolio_cell(value_row,headers,"Amt Disb","Amount disbursed")),"total_due":_portfolio_cents(_portfolio_cell(value_row,headers,"P+I","P + I")),"balance":_portfolio_cents(_portfolio_cell(value_row,headers,"balance")),"formula":formula if is_formula else "","is_formula":is_formula,"last_payment":_portfolio_text(_portfolio_cell(value_row,headers,"Last pay","Last payment")),"guarantor":_portfolio_text(_portfolio_cell(value_row,headers,"Guarantor")),"guarantor_phone":_portfolio_text(_portfolio_cell(value_row,headers,"Contact","Guarantor contact"))})
+        values.close(); formulas.close()
+    except HTTPException: raise
+    except Exception as exc: raise HTTPException(422,f"Could not read workbook: {exc}") from exc
+    formula_count=sum(r["is_formula"] for r in rows)
+    phone_names={}; phone_conflicts=set()
+    for record in rows:
+        key=_phone_key(record["phone"])
+        if not key: continue
+        normalized_name=_name_key(record["name"])
+        if key in phone_names and phone_names[key]!=normalized_name: phone_conflicts.add(record["key"])
+        else: phone_names.setdefault(key,normalized_name)
+    existing_customers=db.scalars(select(Customer).where(Customer.organization_id==user.organization_id,Customer.deleted==False,Customer.phone.is_not(None))).all()
+    existing_phone_names={}
+    for customer_row in existing_customers:
+        if customer_row.phone: existing_phone_names.setdefault(_phone_key(customer_row.phone),set()).add(_name_key(customer_row.full_name))
+    for record in rows:
+        key=_phone_key(record["phone"])
+        if key in existing_phone_names and _name_key(record["name"]) not in existing_phone_names[key]: phone_conflicts.add(record["key"])
+    warnings=[]
+    if any(not r["phone"] for r in rows): warnings.append(f"{sum(not r['phone'] for r in rows)} rows have no phone number; separate customer accounts will be created.")
+    if phone_conflicts: warnings.append(f"{len(phone_conflicts)} rows share a phone number with a differently named customer and will be skipped for manual review.")
+    if formula_count: warnings.append(f"{formula_count} balances are formulas. Their cached spreadsheet values are unverified and will be visibly marked as formula-derived.")
+    if not commit:
+        return {"preview":True,"sheet":"Entire","rows_found":len(rows),"missing_phone":sum(not r["phone"] for r in rows),"phone_conflicts":len(phone_conflicts),"missing_principal":sum(r["principal"] is None for r in rows),"missing_total_due":sum(r["total_due"] is None for r in rows),"missing_balance":sum(r["balance"] is None for r in rows),"formula_balances":formula_count,"manual_balances":len(rows)-formula_count-sum(r["balance"] is None for r in rows),"warnings":warnings}
+    imported=0; existing=0; created_customers=0; conflicts=0
+    try:
+        for record in rows:
+            if db.scalar(select(LegacyPortfolioLoan.id).where(LegacyPortfolioLoan.organization_id==user.organization_id,LegacyPortfolioLoan.source_key==record["key"])):
+                existing+=1; continue
+            phone=record["phone"] or None
+            customer=None
+            if phone:
+                phone_matches=db.scalars(select(Customer).where(Customer.organization_id==user.organization_id,Customer.phone==phone,Customer.deleted==False)).all()
+                if not phone_matches:
+                    phone_matches=db.scalars(select(Customer).where(Customer.organization_id==user.organization_id,Customer.deleted==False)).all()
+                    phone_matches=[c for c in phone_matches if _phone_key(c.phone)==_phone_key(phone)]
+                named=next((c for c in phone_matches if _name_key(c.full_name)==_name_key(record["name"])),None)
+                if named: customer=named
+                elif phone_matches: conflicts+=1; continue
+            if customer is None:
+                customer=Customer(full_name=record["name"],national_id=None,phone=phone,location="Not recorded (legacy import)",occupation=record["occupation"][:120],monthly_income_cents=0,organization_id=user.organization_id,branch_id=user.branch_id)
+                db.add(customer); db.flush(); created_customers+=1
+            snapshot=LegacyPortfolioLoan(customer_id=customer.id,source_key=record["key"],source_sheet="Entire",source_row=record["row"],source_date=record["date"][:80],principal_cents=record["principal"],total_due_cents=record["total_due"],balance_cents=record["balance"],balance_formula=record["formula"],balance_is_formula=record["is_formula"],last_payment=record["last_payment"][:100],guarantor=record["guarantor"][:160],guarantor_phone=record["guarantor_phone"][:30],organization_id=user.organization_id,branch_id=user.branch_id)
+            db.add(snapshot); imported+=1
+        db.add(AuditLog(actor_id=user.id,entity="legacy_portfolio_import",entity_id=0,action="import",details=f"sheet=Entire; imported={imported}; conflicts={conflicts}",organization_id=user.organization_id,branch_id=user.branch_id))
+        db.commit()
+    except Exception:
+        db.rollback(); raise
+    return {"preview":False,"sheet":"Entire","rows_found":len(rows),"imported":imported,"already_imported":existing,"new_customers":created_customers,"skipped_phone_conflicts":conflicts,"formula_balances":formula_count,"warnings":warnings}
 
 @app.get("/api/v1/customers/{customer_id}/profile")
 def customer_profile(customer_id:int,db:Session=Depends(db_session),user:User=Depends(current_user)):
@@ -402,8 +531,9 @@ def customer_profile(customer_id:int,db:Session=Depends(db_session),user:User=De
     payments=db.scalars(select(Payment).where(Payment.loan_id.in_(loan_ids)).order_by(Payment.created_at.desc()).limit(100)).all() if loan_ids else []
     interactions=db.scalars(select(CustomerInteraction).where(CustomerInteraction.customer_id==customer_id,CustomerInteraction.organization_id==user.organization_id).order_by(CustomerInteraction.created_at.desc()).limit(100)).all()
     documents=db.scalars(select(CustomerDocument).where(CustomerDocument.customer_id==customer_id,CustomerDocument.organization_id==user.organization_id).order_by(CustomerDocument.created_at.desc())).all()
+    legacy=db.scalars(select(LegacyPortfolioLoan).where(LegacyPortfolioLoan.customer_id==customer_id,LegacyPortfolioLoan.organization_id==user.organization_id).order_by(LegacyPortfolioLoan.source_row)).all()
     mask=user.role==Role.read_only
-    return {"customer":{"id":customer.id,"full_name":customer.full_name,"national_id":"••••"+customer.national_id[-4:] if mask else customer.national_id,"phone":"••••"+customer.phone[-4:] if mask else customer.phone,"location":customer.location,"next_of_kin":customer.next_of_kin,"guarantors":customer.guarantors,"occupation":customer.occupation,"monthly_income_cents":customer.monthly_income_cents},"loans":loan_cards,"payments":[{"id":p.id,"loan_id":p.loan_id,"amount_cents":p.amount_cents,"method":p.method,"reference":p.reference,"reversed":p.reversed,"status":p.status,"review_note":p.review_note,"created_by":p.created_by,"created_at":p.created_at} for p in payments],"interactions":[{"id":i.id,"interaction_type":i.interaction_type,"summary":i.summary,"direction":i.direction,"follow_up":i.follow_up,"created_at":i.created_at,"username":db.get(User,i.user_id).username if db.get(User,i.user_id) else "Unknown"} for i in interactions],"documents":[{"id":d.id,"document_type":d.document_type,"filename":d.filename,"created_at":d.created_at} for d in documents]}
+    return {"customer":{"id":customer.id,"full_name":customer.full_name,"national_id":"••••"+customer.national_id[-4:] if mask and customer.national_id else customer.national_id,"phone":"••••"+customer.phone[-4:] if mask and customer.phone else customer.phone,"location":customer.location,"next_of_kin":customer.next_of_kin,"guarantors":customer.guarantors,"occupation":customer.occupation,"monthly_income_cents":customer.monthly_income_cents},"loans":loan_cards,"legacy_loans":[{"id":l.id,"source_sheet":l.source_sheet,"source_row":l.source_row,"source_date":l.source_date,"principal_cents":l.principal_cents,"total_due_cents":l.total_due_cents,"balance_cents":l.balance_cents,"balance_formula":l.balance_formula,"balance_is_formula":l.balance_is_formula,"last_payment":l.last_payment,"guarantor":l.guarantor} for l in legacy],"payments":[{"id":p.id,"loan_id":p.loan_id,"amount_cents":p.amount_cents,"method":p.method,"reference":p.reference,"reversed":p.reversed,"status":p.status,"review_note":p.review_note,"created_by":p.created_by,"created_at":p.created_at} for p in payments],"interactions":[{"id":i.id,"interaction_type":i.interaction_type,"summary":i.summary,"direction":i.direction,"follow_up":i.follow_up,"created_at":i.created_at,"username":db.get(User,i.user_id).username if db.get(User,i.user_id) else "Unknown"} for i in interactions],"documents":[{"id":d.id,"document_type":d.document_type,"filename":d.filename,"created_at":d.created_at} for d in documents]}
 
 @app.post("/api/v1/customers/{customer_id}/interactions",status_code=201)
 def create_customer_interaction(customer_id:int,data:InteractionIn,db:Session=Depends(db_session),user:User=Depends(require(*WRITE_ROLES))):

@@ -50,3 +50,8 @@ Never commit `.env`, customer data, a database file, uploaded identity documents
 ## API
 
 The API base path is `/api/v1`. Sign-in returns a bearer token. New users and the initial admin must change their temporary password at first sign-in. Run database migrations with `alembic upgrade head` from this repository root.
+
+
+## Supabase and workbook migration
+
+For the beginner-friendly Render + Supabase setup, required environment variables, database cutover, Vercel API configuration, and the reviewed import flow for the `Entire` workbook tab, see [docs/SUPABASE_MIGRATION.md](docs/SUPABASE_MIGRATION.md).
