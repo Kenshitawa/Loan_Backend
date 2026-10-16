@@ -2,8 +2,8 @@
 
 The import copied source created_at values to newly created customer rows. The
 single pre-existing matched customer has a different timestamp and is kept.
-This script aborts before deletion if the expected records or relationships do
-not match the reviewed import counts.
+The script removes every imported snapshot. Imported customer rows that have
+since acquired non-workbook records are retained so newer work remains available.
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import os
 import sys
 from pathlib import Path
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, inspect, select
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.main import (  # noqa: E402
@@ -88,21 +88,30 @@ def main() -> None:
             if len(snapshot_ids) != 174:
                 raise RuntimeError("Expected 174 imported portfolio snapshots; no records were deleted")
 
-            blockers = {
-                "loans": db.scalar(select(Loan.id).where(Loan.customer_id.in_(imported_ids)).limit(1)),
-                "interactions": db.scalar(select(CustomerInteraction.id).where(CustomerInteraction.customer_id.in_(imported_ids)).limit(1)),
-                "documents": db.scalar(select(CustomerDocument.id).where(CustomerDocument.customer_id.in_(imported_ids)).limit(1)),
-            }
-            present = [name for name, record_id in blockers.items() if record_id is not None]
-            if present:
-                raise RuntimeError(
-                    "Imported customers now have non-workbook records (" + ", ".join(present) + "); no records were deleted"
-                )
+            # Discover every FK into customers.id instead of assuming which
+            # business records may have been created since the import.
+            protected_ids: set[int] = set()
+            inspector = inspect(db.bind)
+            for table_name in inspector.get_table_names(schema="public"):
+                table = Customer.__table__.metadata.tables.get(table_name)
+                if table is None or table.name == LegacyPortfolioLoan.__table__.name:
+                    continue
+                for foreign_key in table.foreign_keys:
+                    if foreign_key.column == Customer.id:
+                        fk_column = table.c[foreign_key.parent.name]
+                        referenced_ids = db.execute(
+                            select(fk_column).where(fk_column.in_(imported_ids)).distinct()
+                        ).scalars().all()
+                        protected_ids.update(referenced_ids)
+
+            deletable_ids = [customer_id for customer_id in imported_ids if customer_id not in protected_ids]
+            retained_count = len(imported_ids) - len(deletable_ids)
 
             db.query(LegacyPortfolioLoan).filter(LegacyPortfolioLoan.id.in_(snapshot_ids)).delete(
                 synchronize_session=False
             )
-            db.query(Customer).filter(Customer.id.in_(imported_ids)).delete(synchronize_session=False)
+            if deletable_ids:
+                db.query(Customer).filter(Customer.id.in_(deletable_ids)).delete(synchronize_session=False)
             db.query(Setting).filter(Setting.key == MARKER).delete(synchronize_session=False)
 
             actor_id = db.scalar(select(User.id).where(User.role == "admin").order_by(User.id).limit(1))
@@ -113,7 +122,11 @@ def main() -> None:
                         entity="legacy_portfolio",
                         entity_id=0,
                         action="rollback",
-                        details="Removed the 174-row Entire workbook import and its 173 newly created customer records; preserved the one matched pre-existing customer.",
+                        details=(
+                            f"Removed 174 Entire workbook portfolio snapshots and {len(deletable_ids)} newly "
+                            f"imported customers; retained {retained_count} imported customers with newer linked records; "
+                            "preserved the one matched pre-existing customer."
+                        ),
                         organization_id=1,
                         branch_id=1,
                     )
@@ -121,7 +134,9 @@ def main() -> None:
 
         print(
             "Workbook rollback completed: snapshots_deleted=174, "
-            "imported_customers_deleted=173, matched_preexisting_customers_preserved=1."
+            f"imported_customers_deleted={len(deletable_ids)}, "
+            f"imported_customers_retained_with_linked_records={retained_count}, "
+            "matched_preexisting_customers_preserved=1."
         )
     finally:
         source_engine.dispose()
