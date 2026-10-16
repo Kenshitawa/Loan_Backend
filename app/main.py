@@ -407,7 +407,7 @@ def download_customer_document(customer_id:int,document_id:int,db:Session=Depend
     return Response(content=content,media_type=media_type,headers={"Content-Disposition":f"attachment; filename*=UTF-8''{quote(doc.filename)}"})
 
 @app.get("/api/v1/customers")
-def list_customers(page:int=Query(1,ge=1),limit:int=Query(25,ge=1,le=100),q:str="",db:Session=Depends(db_session),user:User=Depends(current_user)):
+def list_customers(page:int=Query(1,ge=1),limit:int=Query(25,ge=1,le=500),q:str="",db:Session=Depends(db_session),user:User=Depends(current_user)):
     stmt=select(Customer).where(Customer.deleted==False,Customer.organization_id==user.organization_id)
     if q: stmt=stmt.where((Customer.full_name.ilike(f"%{q}%"))|(Customer.phone.ilike(f"%{q}%"))|(Customer.national_id.ilike(f"%{q}%")))
     total=db.scalar(select(func.count()).select_from(stmt.subquery())) or 0; items=db.scalars(stmt.order_by(Customer.id.desc()).offset((page-1)*limit).limit(limit)).all()
