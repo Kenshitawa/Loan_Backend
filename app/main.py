@@ -7,10 +7,10 @@ import calendar
 from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional
+from typing import Optional, List
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, UploadFile, File, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, UploadFile, File, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
@@ -384,18 +384,13 @@ def remove_user(user_id:int,db:Session=Depends(db_session),user:User=Depends(req
 
 @app.post("/api/v1/customers")
 def create_customer(data:CustomerIn,db:Session=Depends(db_session),user:User=Depends(require(*WRITE_ROLES))):
-    duplicate_filters=[]
-    if data.phone: duplicate_filters.append(Customer.phone==data.phone)
-    if data.national_id: duplicate_filters.append(Customer.national_id==data.national_id)
-    if duplicate_filters and db.scalar(select(Customer).where(Customer.organization_id==user.organization_id,Customer.deleted==False,or_(*duplicate_filters))): raise HTTPException(409,"Customer with that ID or phone already exists")
-    customer=Customer(**data.model_dump(),organization_id=user.organization_id,branch_id=user.branch_id); db.add(customer); db.flush(); db.add(AuditLog(actor_id=user.id,entity="customer",entity_id=customer.id,action="create")); db.commit(); db.refresh(customer); return customer
+    raise HTTPException(422,"Customer registration requires an ID image and profile photo. Use the customer registration form.")
 
-@app.post("/api/v1/customers/{customer_id}/documents")
-async def upload_customer_document(customer_id:int,file:UploadFile=File(...),document_type:str=Query("id_image",pattern="^(id_image|profile_photo|other)$"),db:Session=Depends(db_session),user:User=Depends(require(Role.admin,Role.manager,Role.branch_manager,Role.loan_officer))):
-    customer=db.get(Customer,customer_id)
-    if not customer or customer.organization_id!=user.organization_id: raise HTTPException(404,"Customer not found")
-    if file.content_type not in ("application/pdf","image/jpeg","image/png"): raise HTTPException(415,"Only PDF, JPEG and PNG files are accepted")
-    if document_type=="profile_photo" and file.content_type not in ("image/jpeg","image/png"): raise HTTPException(415,"Profile photos must be JPEG or PNG images")
+async def _save_customer_upload(file:UploadFile,customer_id:int,document_type:str,user:User,db:Session):
+    if file.content_type not in ("application/pdf","image/jpeg","image/png"):
+        raise HTTPException(415,"Only PDF, JPEG and PNG files are accepted")
+    if document_type in ("profile_photo","recovery_asset") and file.content_type not in ("image/jpeg","image/png"):
+        raise HTTPException(415,"Profile and recovery asset photos must be JPEG or PNG images")
     content=await file.read(10*1024*1024+1)
     if len(content)>10*1024*1024: raise HTTPException(413,"Document exceeds 10 MB")
     safe_name=f"{user.organization_id}/{customer_id}/{uuid4().hex}_{Path(file.filename or 'document').name}"
@@ -403,7 +398,36 @@ async def upload_customer_document(customer_id:int,file:UploadFile=File(...),doc
     try: key=customer_storage().save(safe_name,content,file.content_type or "application/octet-stream")
     except RuntimeError as exc: raise HTTPException(503,str(exc)) from exc
     doc=CustomerDocument(customer_id=customer_id,document_type=document_type,filename=Path(file.filename or "document").name,storage_key=key,uploaded_by=user.id,organization_id=user.organization_id,branch_id=user.branch_id)
-    db.add(doc); db.flush(); db.add(AuditLog(actor_id=user.id,entity="customer_document",entity_id=doc.id,action="upload",details=f"customer_id={customer_id},type={document_type}",organization_id=user.organization_id,branch_id=user.branch_id)); db.commit(); db.refresh(doc); return {"id":doc.id,"customer_id":doc.customer_id,"document_type":doc.document_type,"filename":doc.filename,"created_at":doc.created_at}
+    db.add(doc)
+    return doc
+
+@app.post("/api/v1/customers/register",status_code=201)
+async def register_customer(
+    full_name:str=Form(...),location:str=Form(...),national_id:Optional[str]=Form(None),phone:Optional[str]=Form(None),
+    next_of_kin:str=Form(""),guarantors:str=Form(""),occupation:str=Form(""),monthly_income_cents:int=Form(0,ge=0),
+    id_file:UploadFile=File(...),profile_photo_file:UploadFile=File(...),asset_images:Optional[List[UploadFile]]=File(None),
+    db:Session=Depends(db_session),user:User=Depends(require(*WRITE_ROLES))
+):
+    duplicate_filters=[]
+    if phone: duplicate_filters.append(Customer.phone==phone)
+    if national_id: duplicate_filters.append(Customer.national_id==national_id)
+    if duplicate_filters and db.scalar(select(Customer).where(Customer.organization_id==user.organization_id,Customer.deleted==False,or_(*duplicate_filters))):
+        raise HTTPException(409,"Customer with that ID or phone already exists")
+    customer=Customer(full_name=full_name,national_id=national_id or None,phone=phone or None,location=location,next_of_kin=next_of_kin,guarantors=guarantors,occupation=occupation,monthly_income_cents=monthly_income_cents,organization_id=user.organization_id,branch_id=user.branch_id)
+    db.add(customer); db.flush()
+    docs=[await _save_customer_upload(id_file,customer.id,"id_image",user,db),await _save_customer_upload(profile_photo_file,customer.id,"profile_photo",user,db)]
+    for asset in asset_images or []:
+        if asset.filename: docs.append(await _save_customer_upload(asset,customer.id,"recovery_asset",user,db))
+    db.add(AuditLog(actor_id=user.id,entity="customer",entity_id=customer.id,action="create",organization_id=user.organization_id,branch_id=user.branch_id))
+    db.commit(); db.refresh(customer)
+    return {"id":customer.id,"full_name":customer.full_name,"documents":[{"id":doc.id,"document_type":doc.document_type,"filename":doc.filename} for doc in docs]}
+
+@app.post("/api/v1/customers/{customer_id}/documents")
+async def upload_customer_document(customer_id:int,file:UploadFile=File(...),document_type:str=Query("id_image",pattern="^(id_image|profile_photo|recovery_asset|other)$"),db:Session=Depends(db_session),user:User=Depends(require(Role.admin,Role.manager,Role.branch_manager,Role.loan_officer))):
+    customer=db.get(Customer,customer_id)
+    if not customer or customer.organization_id!=user.organization_id: raise HTTPException(404,"Customer not found")
+    doc=await _save_customer_upload(file,customer_id,document_type,user,db)
+    db.flush(); db.add(AuditLog(actor_id=user.id,entity="customer_document",entity_id=doc.id,action="upload",details=f"customer_id={customer_id},type={document_type}",organization_id=user.organization_id,branch_id=user.branch_id)); db.commit(); db.refresh(doc); return {"id":doc.id,"customer_id":doc.customer_id,"document_type":doc.document_type,"filename":doc.filename,"created_at":doc.created_at}
 
 @app.get("/api/v1/customers/{customer_id}/documents/{document_id}")
 def download_customer_document(customer_id:int,document_id:int,db:Session=Depends(db_session),user:User=Depends(require(Role.admin,Role.manager,Role.branch_manager,Role.loan_officer))):
@@ -510,6 +534,27 @@ def update_status(loan_id:int,data:StatusIn,db:Session=Depends(db_session),user:
 @app.get("/api/v1/loans/{loan_id}/schedule")
 def schedule(loan_id:int,db:Session=Depends(db_session),user:User=Depends(current_user)):
     return db.scalars(select(Installment).where(Installment.loan_id==loan_id,Installment.organization_id==user.organization_id).order_by(Installment.number)).all()
+
+@app.get("/api/v1/loans/{loan_id}/transcript.csv")
+def loan_transcript(loan_id:int,db:Session=Depends(db_session),user:User=Depends(current_user)):
+    import csv,io
+    loan=db.get(Loan,loan_id)
+    if not loan or loan.organization_id!=user.organization_id: raise HTTPException(404,"Loan not found")
+    customer=db.get(Customer,loan.customer_id); product=db.get(LoanProduct,loan.product_id)
+    stream=io.StringIO(); writer=csv.writer(stream)
+    writer.writerow(["MWANGAZABIz loan transcript"]); writer.writerow(["Loan account",f"MW-{loan.id:05d}"])
+    writer.writerow(["Customer",customer.full_name if customer else "Unknown"]); writer.writerow(["Product",product.name if product else "Loan product"])
+    writer.writerow(["Principal (KES)",f"{loan.principal_cents/100:.2f}"]); writer.writerow(["Status",loan.status.value])
+    writer.writerow(["Disbursed at",loan.disbursed_at.isoformat() if loan.disbursed_at else "Not disbursed"]); writer.writerow([])
+    writer.writerow(["Repayment history"]); writer.writerow(["Date","Amount (KES)","Method","Reference","Status","Review note","Reversal reason"])
+    payments=db.scalars(select(Payment).where(Payment.loan_id==loan.id,Payment.organization_id==user.organization_id).order_by(Payment.created_at,Payment.id)).all()
+    for payment in payments:
+        writer.writerow([payment.created_at.isoformat(),f"{payment.amount_cents/100:.2f}",payment.method,payment.reference,"reversed" if payment.reversed else payment.status,payment.review_note,payment.reversal_reason])
+    writer.writerow([]); writer.writerow(["Repayment schedule"]); writer.writerow(["Installment","Due date","Principal (KES)","Interest (KES)","Fees (KES)","Total due (KES)"])
+    installments=db.scalars(select(Installment).where(Installment.loan_id==loan.id,Installment.organization_id==user.organization_id).order_by(Installment.number)).all()
+    for item in installments:
+        writer.writerow([item.number,item.due_date.isoformat(),f"{item.principal_cents/100:.2f}",f"{item.interest_cents/100:.2f}",f"{item.fees_cents/100:.2f}",f"{(item.principal_cents+item.interest_cents+item.fees_cents)/100:.2f}"])
+    return Response(stream.getvalue(),media_type="text/csv; charset=utf-8",headers={"Content-Disposition":f"attachment; filename=mwangazabiz-loan-{loan.id}-transcript.csv"})
 
 @app.post("/api/v1/payments")
 def record_payment(data:PaymentIn,db:Session=Depends(db_session),user:User=Depends(require(Role.admin,Role.manager,Role.branch_manager,Role.accountant,Role.collections_officer)) ,idempotency_key:str=Header(...,alias="Idempotency-Key")):
