@@ -45,11 +45,11 @@ In the existing Render API service, set/update these environment variables. Keep
 
 Render will redeploy, run Alembic migrations, and connect to Supabase. New customer ID and profile uploads will go to the private Supabase bucket and will still be served through the authenticated API. Existing local uploads are not automatically copied; export any still-accessible files before the Render service restarts if you need them.
 
-## 4. Set the Vercel API address and import the selected workbook
+## 4. Set the Vercel API address
 
 In the Vercel project for the frontend, add `VITE_API_URL` with the full API prefix, for example `https://YOUR-RENDER-SERVICE.onrender.com/api/v1`, then redeploy the frontend. In Render, set `CORS_ORIGINS` to the exact Vercel site origin (for example `https://your-app.vercel.app`) so browser requests are allowed. Do not put database URLs or Supabase service-role keys in Vercel.
 
-After the API and frontend point to the Supabase-backed deployment, sign in as an administrator, open **Customers**, choose **Import Entire workbook**, inspect the preview, and click **Confirm import**. The preview must show the expected row counts before confirmation. The importer is safe to retry: rows already imported from this workbook are detected. It creates customer accounts for missing-phone rows and skips phone-number conflicts where the same phone belongs to a differently named customer. The workbook's imported balance data stays on a separate legacy-snapshot panel and does not alter verified loan balances, schedules, repayments, or reports. Formula-derived balance cells are identified as unverified. Review these with staff before using them operationally.
+The selected `Entire` worksheet has been imported as legacy opening-balance snapshots. Those snapshots remain separate from live loans, schedules, payments, and ledger balances. Formula-derived workbook balances are marked unverified and should be reviewed with staff before operational use. The upload/import feature was removed after the one-time import.
 
 ## 5. Verify before removing the old database
 

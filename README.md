@@ -54,4 +54,4 @@ The API base path is `/api/v1`. Sign-in returns a bearer token. New users and th
 
 ## Supabase and workbook migration
 
-For the beginner-friendly Render + Supabase setup, required environment variables, database cutover, Vercel API configuration, and the reviewed import flow for the `Entire` workbook tab, see [docs/SUPABASE_MIGRATION.md](docs/SUPABASE_MIGRATION.md).
+For the beginner-friendly Render + Supabase setup, required environment variables, database cutover, and Vercel API configuration, see [docs/SUPABASE_MIGRATION.md](docs/SUPABASE_MIGRATION.md). The selected legacy portfolio has been imported as opening-balance snapshots; the upload feature was removed after import.
