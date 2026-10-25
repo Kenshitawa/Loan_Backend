@@ -265,7 +265,16 @@ class StatusIn(BaseModel): status:LoanStatus; note:str=""
 class ActivityIn(BaseModel): activity:str; notes:str=""; follow_up:Optional[date]=None
 
 app=FastAPI(title="MWANGAZABIz Loan Management", version="1.0.0", description="API-first lending operations for Kenyan lenders")
-app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS","http://localhost:5173,http://127.0.0.1:5173").split(","), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS","http://localhost:5173,http://127.0.0.1:5173").split(","), allow_credentials=True, allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"], allow_headers=["Authorization","Content-Type"])
+
+@app.middleware("http")
+async def add_security_headers(request:Request, call_next):
+    response=await call_next(request)
+    response.headers["X-Content-Type-Options"]="nosniff"
+    response.headers["X-Frame-Options"]="DENY"
+    response.headers["Referrer-Policy"]="strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"]="camera=(), microphone=(), geolocation=()"
+    return response
 
 @app.on_event("startup")
 def startup():
@@ -653,7 +662,7 @@ def add_activity(loan_id:int,data:ActivityIn,db:Session=Depends(db_session),user
 
 @app.get("/api/v1/reports/summary")
 def report_summary(db:Session=Depends(db_session),user:User=Depends(current_user)):
-    loans=db.scalars(select(Loan).where(Loan.organization_id==user.organization_id)).all(); active=[l for l in loans if l.status in (LoanStatus.active,LoanStatus.disbursed,LoanStatus.restructured)]; payments=db.scalars(select(Payment).where(Payment.organization_id==user.organization_id,Payment.reversed==False,Payment.status=="confirmed")).all(); ledger=db.scalars(select(LedgerEntry).where(LedgerEntry.organization_id==user.organization_id)).all(); disbursed=sum(l.principal_cents for l in loans if l.disbursed_at); collected=sum(p.amount_cents for p in payments); outstanding=sum(x.debit_cents-x.credit_cents for x in ledger if x.account=="loan_receivable")
+    loans=db.scalars(select(Loan).where(Loan.organization_id==user.organization_id)).all(); active=[l for l in loans if l.status in (LoanStatus.active,LoanStatus.disbursed,LoanStatus.restructured)]; payments=db.scalars(select(Payment).where(Payment.organization_id==user.organization_id,Payment.reversed==False,Payment.status=="confirmed")).all(); ledger=db.scalars(select(LedgerEntry).where(LedgerEntry.organization_id==user.organization_id)).all(); disbursed=sum(l.principal_cents for l in loans if l.disbursed_at); collected=sum(p.amount_cents for p in payments); receivable_accounts={"loan_receivable","interest_receivable","fee_receivable","penalty_receivable"}; outstanding=sum(x.debit_cents-x.credit_cents for x in ledger if x.account in receivable_accounts)
     overdue=db.scalars(select(Installment).join(Loan,Installment.loan_id==Loan.id).where(Loan.organization_id==user.organization_id,Installment.due_date<date.today())).all(); par=sum(i.principal_cents+i.interest_cents for i in overdue)
     pending_payments=db.scalar(select(func.count()).select_from(Payment).where(Payment.organization_id==user.organization_id,Payment.status=="pending")) or 0
     return {"currency":"KES","portfolio_outstanding_cents":max(0,outstanding),"disbursed_cents":disbursed,"collected_cents":collected,"active_loans":len(active),"overdue_installments":len(overdue),"pending_payments":pending_payments,"par_cents":par,"collection_rate":round(collected/disbursed,4) if disbursed else 0}
